@@ -30,7 +30,7 @@ def on_checkin_insert(doc, method):
 		triggered_by_checkin=doc.name,
 		checkin_time=str(doc.time),
 		deduplicate=True,
-		job_name=f"reconcile_{employee}_{attendance_date}",
+		job_id=f"reconcile_{employee}_{attendance_date}",
 	)
 
 
@@ -304,7 +304,7 @@ def daily_sweep():
 					triggered_by_checkin="daily_sweep",
 					checkin_time=str(now_datetime()),
 					deduplicate=True,
-					job_name=f"reconcile_{record.employee}_{date}",
+					job_id=f"reconcile_{record.employee}_{date}",
 				)
 
 
@@ -351,7 +351,7 @@ def manual_backdate_reconcile(from_date, to_date):
 				triggered_by_checkin="manual_backdate",
 				checkin_time=str(now_datetime()),
 				deduplicate=True,
-				job_name=f"reconcile_{record.employee}_{date}",
+				job_id=f"reconcile_{record.employee}_{date}",
 			)
 			queued += 1
 

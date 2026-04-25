@@ -7,6 +7,10 @@ app_license = "mit"
 
 required_apps = ["hrms"]
 
+doctype_list_js = {
+	"Attendance": "public/js/attendance_list.js"
+}
+
 doc_events = {
 	"Employee Checkin": {
 		"after_insert": "hrms_enhanced.attendance.reconciliation.on_checkin_insert"

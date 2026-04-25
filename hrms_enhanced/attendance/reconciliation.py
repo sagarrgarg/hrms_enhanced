@@ -243,32 +243,13 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		)
 		return
 
-	update_values = {
-		"status": attendance_status,
-		"working_hours": working_hours,
-		"late_entry": late_entry,
-		"early_exit": early_exit,
-		"in_time": in_time,
-		"out_time": out_time,
-	}
-	if shift_to_use:
-		update_values["shift"] = shift_to_use
-
-	absent_doc.db_set(update_values)
-
-	absent_doc.add_comment(
-		comment_type="Info",
-		text=(
-			f"Attendance reconciled from Absent to {attendance_status} "
-			f"by hrms_enhanced (triggered by late checkin sync). "
-			f"Working hours: {working_hours}, Late: {late_entry}, Early exit: {early_exit}"
-		),
-	)
-
 	log_names = [c.name for c in checkins]
 
-	# link checkins to the reconciled attendance and clear the skip flag
-	# so they show as properly processed in HRMS views
+	# Step 1: claim checkins FIRST — set attendance link and commit immediately.
+	# This closes the race window with HRMS auto-attendance scheduler, which
+	# filters on "attendance IS NOT SET" in get_employee_checkins(). Once we
+	# set the link, those checkins become invisible to process_auto_attendance
+	# and it can't overwrite skip_auto_attendance after we clear it.
 	EmployeeCheckin = frappe.qb.DocType("Employee Checkin")
 	(
 		frappe.qb.update(EmployeeCheckin)
@@ -276,19 +257,55 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		.set(EmployeeCheckin.skip_auto_attendance, 0)
 		.where(EmployeeCheckin.name.isin(log_names))
 	).run()
-
-	_log_reconciliation(
-		employee=employee,
-		attendance_date=attendance_date,
-		previous_status="Absent",
-		new_status=attendance_status,
-		attendance_record=absent_name,
-		triggered_by_checkin=triggered_by_checkin,
-		checkin_time=checkin_time,
-		notes=f"Working hours: {working_hours}, Shift: {shift_to_use}, Checkins: {len(log_names)}",
-	)
-
 	frappe.db.commit()
+
+	# Step 2: update Attendance record — safe because checkins are already claimed.
+	# If this fails, unclaim checkins so they can be retried.
+	try:
+		update_values = {
+			"status": attendance_status,
+			"working_hours": working_hours,
+			"late_entry": late_entry,
+			"early_exit": early_exit,
+			"in_time": in_time,
+			"out_time": out_time,
+		}
+		if shift_to_use:
+			update_values["shift"] = shift_to_use
+
+		absent_doc.db_set(update_values)
+
+		absent_doc.add_comment(
+			comment_type="Info",
+			text=(
+				f"Attendance reconciled from Absent to {attendance_status} "
+				f"by hrms_enhanced (triggered by late checkin sync). "
+				f"Working hours: {working_hours}, Late: {late_entry}, Early exit: {early_exit}"
+			),
+		)
+
+		_log_reconciliation(
+			employee=employee,
+			attendance_date=attendance_date,
+			previous_status="Absent",
+			new_status=attendance_status,
+			attendance_record=absent_name,
+			triggered_by_checkin=triggered_by_checkin,
+			checkin_time=checkin_time,
+			notes=f"Working hours: {working_hours}, Shift: {shift_to_use}, Checkins: {len(log_names)}",
+		)
+
+		frappe.db.commit()
+
+	except Exception:
+		# unclaim checkins so daily sweep or manual retry can pick them up
+		(
+			frappe.qb.update(EmployeeCheckin)
+			.set(EmployeeCheckin.attendance, "")
+			.where(EmployeeCheckin.name.isin(log_names))
+		).run()
+		frappe.db.commit()
+		raise
 
 
 def _has_checkins_for_date(employee, date):

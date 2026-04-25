@@ -72,10 +72,46 @@ def reconcile_attendance(employee, attendance_date, triggered_by_checkin=None, c
 			pass
 
 
+def _get_checkins_for_reconciliation(employee, attendance_date, absent_name):
+	"""Get all checkins usable for reconciliation.
+
+	Ignores skip_auto_attendance — that flag is set by the HRMS auto-attendance
+	scheduler when it finds existing attendance (our Absent record) and bails out
+	with DuplicateAttendanceError. Those checkins are exactly the ones we need.
+
+	Excludes checkins already linked to a different (non-Absent) submitted attendance
+	to avoid stealing checkins from a valid record.
+	"""
+	all_checkins = frappe.get_all(
+		"Employee Checkin",
+		filters={
+			"employee": employee,
+			"time": ("between", [f"{attendance_date} 00:00:00", f"{attendance_date} 23:59:59"]),
+		},
+		fields=[
+			"name", "employee", "log_type", "time", "shift",
+			"shift_start", "shift_end", "shift_actual_start", "shift_actual_end",
+			"device_id", "attendance", "skip_auto_attendance",
+		],
+		order_by="time asc",
+	)
+
+	checkins = []
+	for c in all_checkins:
+		if not c.attendance or c.attendance == absent_name:
+			checkins.append(c)
+			continue
+		# linked to another attendance — only include if that attendance is cancelled
+		linked_docstatus = frappe.db.get_value("Attendance", c.attendance, "docstatus")
+		if linked_docstatus == 2:
+			checkins.append(c)
+
+	return checkins
+
+
 def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time):
 	attendance_date = str(getdate(attendance_date))
 
-	# skip if approved leave attendance exists
 	leave_attendance = frappe.db.exists(
 		"Attendance",
 		{
@@ -98,7 +134,6 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		)
 		return
 
-	# skip if submitted Salary Slip covers this date
 	salary_slip = frappe.db.exists(
 		"Salary Slip",
 		{
@@ -120,7 +155,6 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		)
 		return
 
-	# find the Absent attendance record
 	absent_name = frappe.db.exists(
 		"Attendance",
 		{
@@ -145,21 +179,7 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 	absent_doc = frappe.get_doc("Attendance", absent_name)
 	shift_name = absent_doc.shift
 
-	# get all checkins for this employee/date that are not skipped
-	checkins = frappe.get_all(
-		"Employee Checkin",
-		filters={
-			"employee": employee,
-			"time": ("between", [f"{attendance_date} 00:00:00", f"{attendance_date} 23:59:59"]),
-			"skip_auto_attendance": 0,
-		},
-		fields=[
-			"name", "employee", "log_type", "time", "shift",
-			"shift_start", "shift_end", "shift_actual_start", "shift_actual_end",
-			"device_id",
-		],
-		order_by="time asc",
-	)
+	checkins = _get_checkins_for_reconciliation(employee, attendance_date, absent_name)
 
 	if not checkins:
 		_log_reconciliation(
@@ -174,13 +194,11 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		)
 		return
 
-	# if shift is known, filter checkins to that shift; also try checkins with matching shift
 	if shift_name:
 		shift_checkins = [c for c in checkins if c.shift == shift_name]
 		if shift_checkins:
 			checkins = shift_checkins
 
-	# compute attendance using ShiftType logic
 	shift_to_use = shift_name or (checkins[0].shift if checkins[0].shift else None)
 
 	if shift_to_use:
@@ -190,7 +208,6 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 				shift_doc.get_attendance(checkins)
 			)
 		except Exception:
-			# fallback: if shift calculation fails, mark Present with basic working hours
 			from hrms.hr.doctype.employee_checkin.employee_checkin import calculate_working_hours
 
 			working_hours, in_time, out_time = calculate_working_hours(
@@ -226,7 +243,6 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		)
 		return
 
-	# in-place overwrite using db_set pattern from Attendance Request
 	update_values = {
 		"status": attendance_status,
 		"working_hours": working_hours,
@@ -249,11 +265,17 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		),
 	)
 
-	# link checkins to this attendance record
 	log_names = [c.name for c in checkins]
-	from hrms.hr.doctype.employee_checkin.employee_checkin import update_attendance_in_checkins
 
-	update_attendance_in_checkins(log_names, absent_name)
+	# link checkins to the reconciled attendance and clear the skip flag
+	# so they show as properly processed in HRMS views
+	EmployeeCheckin = frappe.qb.DocType("Employee Checkin")
+	(
+		frappe.qb.update(EmployeeCheckin)
+		.set(EmployeeCheckin.attendance, absent_name)
+		.set(EmployeeCheckin.skip_auto_attendance, 0)
+		.where(EmployeeCheckin.name.isin(log_names))
+	).run()
 
 	_log_reconciliation(
 		employee=employee,
@@ -263,10 +285,21 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		attendance_record=absent_name,
 		triggered_by_checkin=triggered_by_checkin,
 		checkin_time=checkin_time,
-		notes=f"Working hours: {working_hours}, Shift: {shift_to_use}",
+		notes=f"Working hours: {working_hours}, Shift: {shift_to_use}, Checkins: {len(log_names)}",
 	)
 
 	frappe.db.commit()
+
+
+def _has_checkins_for_date(employee, date):
+	"""Check if ANY checkins exist for employee/date, regardless of skip flag."""
+	return frappe.db.exists(
+		"Employee Checkin",
+		{
+			"employee": employee,
+			"time": ("between", [f"{date} 00:00:00", f"{date} 23:59:59"]),
+		},
+	)
 
 
 def daily_sweep():
@@ -286,16 +319,7 @@ def daily_sweep():
 		)
 
 		for record in absent_records:
-			has_checkins = frappe.db.exists(
-				"Employee Checkin",
-				{
-					"employee": record.employee,
-					"time": ("between", [f"{date} 00:00:00", f"{date} 23:59:59"]),
-					"skip_auto_attendance": 0,
-				},
-			)
-
-			if has_checkins:
+			if _has_checkins_for_date(record.employee, date):
 				frappe.enqueue(
 					"hrms_enhanced.attendance.reconciliation.reconcile_attendance",
 					queue="long",
@@ -334,15 +358,7 @@ def manual_backdate_reconcile(from_date, to_date):
 	queued = 0
 	for record in absent_records:
 		date = str(record.attendance_date)
-		has_checkins = frappe.db.exists(
-			"Employee Checkin",
-			{
-				"employee": record.employee,
-				"time": ("between", [f"{date} 00:00:00", f"{date} 23:59:59"]),
-				"skip_auto_attendance": 0,
-			},
-		)
-		if has_checkins:
+		if _has_checkins_for_date(record.employee, date):
 			frappe.enqueue(
 				"hrms_enhanced.attendance.reconciliation.reconcile_attendance",
 				queue="long",

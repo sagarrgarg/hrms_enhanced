@@ -1,5 +1,7 @@
+import inspect
+
 import frappe
-from frappe.utils import getdate, nowdate, add_days, now_datetime, get_datetime
+from frappe.utils import getdate, nowdate, add_days, now_datetime, get_datetime, flt
 
 
 def on_checkin_insert(doc, method):
@@ -205,7 +207,7 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		try:
 			shift_doc = frappe.get_cached_doc("Shift Type", shift_to_use)
 			attendance_status, working_hours, late_entry, early_exit, in_time, out_time = (
-				shift_doc.get_attendance(checkins)
+				_get_shift_attendance(shift_doc, checkins, employee, attendance_date)
 			)
 		except Exception:
 			from hrms.hr.doctype.employee_checkin.employee_checkin import calculate_working_hours
@@ -306,6 +308,30 @@ def _do_reconcile(employee, attendance_date, triggered_by_checkin, checkin_time)
 		).run()
 		frappe.db.commit()
 		raise
+
+
+def _get_shift_attendance(shift_doc, checkins, employee, attendance_date):
+	"""Call ShiftType.get_attendance with the signature this HRMS version has.
+
+	v15: get_attendance(logs) reads the thresholds from the Shift Type itself.
+	v16: get_attendance(logs, threshold_for_absent, threshold_for_half_day). Calling it
+	the v15 way raises TypeError, which the caller's fallback would silently turn into
+	"Present", so pass the thresholds exactly as v16's ShiftType.process_auto_attendance
+	computes them (halved on a half-day holiday).
+	"""
+	params = inspect.signature(shift_doc.get_attendance).parameters
+	if "working_hours_threshold_for_absent" not in params:
+		return shift_doc.get_attendance(checkins)
+
+	working_hours_threshold_for_half_day = flt(shift_doc.working_hours_threshold_for_half_day)
+	working_hours_threshold_for_absent = flt(shift_doc.working_hours_threshold_for_absent)
+	if shift_doc.is_half_holiday(employee, getdate(attendance_date)):
+		working_hours_threshold_for_half_day = flt(shift_doc.working_hours_threshold_for_half_day) / 2
+		working_hours_threshold_for_absent = flt(shift_doc.working_hours_threshold_for_absent) / 2
+
+	return shift_doc.get_attendance(
+		checkins, working_hours_threshold_for_absent, working_hours_threshold_for_half_day
+	)
 
 
 def _has_checkins_for_date(employee, date):
